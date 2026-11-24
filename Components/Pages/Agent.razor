@@ -1,0 +1,195 @@
+﻿@page "/"
+@rendermode InteractiveServer
+@using AI4SchoolAgent.Services
+@using GitHub.Copilot
+@using Markdig
+@using Ganss.Xss
+@inject AgentService AgentService
+@inject ILogger<Agent> Logger
+
+<PageTitle>School AI Agent</PageTitle>
+
+<h3>Web & Mobile Option - COMP4976 - School Admin AI Agent</h3>
+
+@if (IsBusy)
+{
+    <p class="alert alert-info mt-3" role="status">Thinking...</p>
+}
+
+<div class="agent-layout">
+    <div class="agent-conversation">
+        <div class="chat-window">
+            @foreach (var message in Messages)
+            {
+                <div class="message">
+                    <b>@message.Role:</b>
+                    @if (message.Role == "Agent")
+                    {
+                        <div class="agent-reply">@RenderReply(message.Content)</div>
+                    }
+                    else
+                    {
+                        <div>@message.Content</div>
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="mt-3">
+            <div class="mb-3">
+                <label for="agent-model" class="form-label">AI model</label>
+                <select id="agent-model" class="form-select" @bind="SelectedModelId"
+                        disabled="@(IsLoadingModels || IsBusy)">
+                    <option value="auto">Auto (Copilot chooses)</option>
+                    @foreach (var model in Models)
+                    {
+                        <option value="@model.Id">@model.Name</option>
+                    }
+                </select>
+                @if (IsLoadingModels)
+                {
+                    <div class="form-text" role="status">Loading Copilot models...</div>
+                }
+                else if (ModelLoadMessage is not null)
+                {
+                    <div class="form-text" role="status">@ModelLoadMessage</div>
+                }
+            </div>
+
+            <InputTextArea class="form-control" rows="4" @bind-Value="Prompt" aria-label="Ask the agent" />
+            <button class="btn btn-primary mt-2" @onclick="SendPromptAsync" disabled="@(IsLoadingModels || IsBusy)">
+                Ask Agent
+            </button>
+        </div>
+    </div>
+
+    <aside class="activity-panel" aria-label="Tool and SQL activity">
+        <h4>Tool and SQL activity</h4>
+        @if (Activity.Count == 0)
+        {
+            <p class="text-muted">Tool calls and SQL statements will appear here.</p>
+        }
+        else
+        {
+            @foreach (var entry in Activity)
+            {
+                <div class="activity-entry">
+                    <strong>@entry.Label</strong>
+                    <pre>@entry.Content</pre>
+                </div>
+            }
+        }
+    </aside>
+</div>
+
+@if (!string.IsNullOrEmpty(ErrorMessage)) {
+    <div class="alert alert-danger mt-3" role="alert">@ErrorMessage</div>
+}
+
+@code {
+
+    string Prompt = "";
+
+    bool IsBusy;
+
+    bool IsLoadingModels = true;
+
+    string SelectedModelId = "auto";
+
+    IReadOnlyList<ModelInfo> Models = [];
+
+    string? ModelLoadMessage;
+
+    string? ErrorMessage;
+
+    List<ChatMessage> Messages = new();
+
+    List<AgentActivity> Activity = new();
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender)
+            return;
+
+        try
+        {
+            Models = (await AgentService.ListModelsAsync())
+                .Where(model => !string.Equals(model.Id, "auto", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(model.Policy?.State, "disabled", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(model => model.Name)
+                .ToArray();
+
+            if (Models.Count == 0)
+                ModelLoadMessage = "Copilot reported no selectable models. Auto is still available.";
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or RemoteRpcException
+            or System.ComponentModel.Win32Exception or TimeoutException)
+        {
+            Logger.LogWarning(ex, "Could not load the Copilot model list.");
+            ModelLoadMessage = "Could not load Copilot models. Check the server's Copilot sign-in or try using Auto.";
+        }
+        finally
+        {
+            IsLoadingModels = false;
+            StateHasChanged();
+        }
+    }
+
+    async Task SendPromptAsync()
+    {
+        if (IsLoadingModels || IsBusy || string.IsNullOrWhiteSpace(Prompt))
+            return;
+
+        Messages.Add(new ChatMessage
+        {
+            Role = "User",
+            Content = Prompt
+        });
+
+        IsBusy = true;
+        ErrorMessage = null;
+        Activity.Clear();
+
+        try {
+            var activity = new Progress<AgentActivity>(entry =>
+            {
+                Activity.Add(entry);
+                StateHasChanged();
+            });
+            var result = await AgentService.AskAsync(Prompt, SelectedModelId, activity);
+
+            Messages.Add(new ChatMessage
+            {
+                Role = "Agent",
+                Content = result
+            });
+
+            Prompt = "";
+        } catch (Exception ex) {
+            ErrorMessage = $"Unable to get a response: {ex.Message}";
+        } finally {
+            IsBusy = false;
+        }
+    }
+
+    class ChatMessage {
+        public string Role { get; set; } = "";
+        public string Content { get; set; } = "";
+    }
+
+    private static readonly MarkdownPipeline ReplyMarkdown =
+    new MarkdownPipelineBuilder().UsePipeTables().DisableHtml().Build();
+
+    private static readonly HtmlSanitizer ReplySanitizer = new(new HtmlSanitizerOptions
+    {
+        AllowedTags = new HashSet<string>
+    {
+        "p", "br", "strong", "em", "ul", "ol", "li", "pre", "code",
+        "table", "thead", "tbody", "tr", "th", "td"
+    },
+        AllowedAttributes = new HashSet<string>()
+    });
+
+    private static MarkupString RenderReply(string content) =>
+        new(ReplySanitizer.Sanitize(Markdown.ToHtml(content, ReplyMarkdown)));
+}
